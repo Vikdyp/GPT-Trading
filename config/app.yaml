@@ -1,0 +1,48 @@
+env: dev
+timezone: "Europe/Paris"
+
+symbols_seed:
+  - "BTCEUR"
+  - "ETHEUR"
+  - "BNBEUR"
+  - "SOLEUR"
+  - "XRPEUR"
+  - "ADAEUR"
+  - "DOGEEUR"
+  - "LINKEUR"
+  - "LTCEUR"
+  - "AVAXEUR"
+  - "DOTEUR"
+  - "OPEUR"
+
+volume24h_min_eur: 200000   # filter pairs by 24h volume (>200k EUR)
+
+timeframes:
+  live: "1m"    # WS kline stream
+  signal: "1m"
+  trend_filter: "4h"
+
+risk:
+  initial_equity_eur: 140
+  base_risk_pct: 0.8         # base risk per trade (percent of equity, before f(score), g(DD))
+  hard_cap_pct: 5.0          # absolute per-trade notional cap as % equity
+  max_daily_loss_pct: 6.0    # kill-switch
+  vol_target_daily_pct: 1.0  # daily volatility target for vol-sizer
+
+execution:
+  price_band_bps: 30         # limit within ±30 bps from mid; fallback market if strong
+  allow_market_fallback: true
+  test_orders: true          # use /order/test before real order
+
+dashboard:
+  ws_refresh_ms: 500
+
+strategy:
+  ema_fast: 9
+  ema_slow: 21
+  rsi_len: 14
+  rsi_buy_max: 70
+  atr_len: 14
+  atr_mult: 2.0
+  trend_ema_4h: 200
+
