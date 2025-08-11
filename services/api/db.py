@@ -186,3 +186,93 @@ async def get_equity_series(session: AsyncSession, since: datetime):
         m["equity_eur"] = float(m["equity_eur"])
         out.append(m)
     return out
+
+# ---------- EVENTS / METRICS / HELPERS ----------
+
+async def ensure_events_table(session: AsyncSession):
+    # Safe-guard si la migration n'a pas été appliquée
+    await session.execute(text("""
+        CREATE TABLE IF NOT EXISTS events (
+          id BIGSERIAL PRIMARY KEY,
+          ts TIMESTAMPTZ NOT NULL DEFAULT now(),
+          level TEXT NOT NULL,
+          source TEXT NOT NULL,
+          type TEXT NOT NULL,
+          payload JSONB NOT NULL
+        );
+        CREATE INDEX IF NOT EXISTS idx_events_ts ON events(ts DESC);
+    """))
+
+async def insert_event(session: AsyncSession, level: str, source: str, type_: str, payload: Dict[str, Any]):
+    await ensure_events_table(session)
+    q = text("""
+        INSERT INTO events (level, source, type, payload, ts)
+        VALUES (:lvl, :src, :typ, :pl, now())
+        RETURNING id
+    """)
+    res = await session.execute(q, {"lvl": level, "src": source, "typ": type_, "pl": json.dumps(payload)})
+    row = res.fetchone()
+    return row[0] if row else None
+
+async def get_position(session: AsyncSession, symbol: str):
+    q = text("""SELECT qty, avg_px FROM positions WHERE symbol=:s LIMIT 1""")
+    res = await session.execute(q, {"s": symbol})
+    row = res.fetchone()
+    if not row:
+        return None
+    m = dict(row._mapping)
+    return float(m["qty"]), float(m["avg_px"])
+
+async def metrics_add_trade(session: AsyncSession, realized_pnl_eur: float, fee_eur: float, turnover_eur: float):
+    # Upsert pour aujourd'hui
+    q = text("""
+        INSERT INTO metrics_daily (day, pnl, fees, turnover, trades)
+        VALUES (current_date, :p, :f, :t, 1)
+        ON CONFLICT (day) DO UPDATE
+        SET pnl = metrics_daily.pnl + EXCLUDED.pnl,
+            fees = metrics_daily.fees + EXCLUDED.fees,
+            turnover = metrics_daily.turnover + EXCLUDED.turnover,
+            trades = metrics_daily.trades + EXCLUDED.trades
+    """)
+    await session.execute(q, {"p": float(realized_pnl_eur or 0.0), "f": float(fee_eur or 0.0), "t": float(turnover_eur or 0.0)})
+
+async def get_metrics_range(session: AsyncSession, since: datetime):
+    q = text("""
+        SELECT day, pnl, fees, turnover, trades
+        FROM metrics_daily
+        WHERE day >= :since
+        ORDER BY day ASC
+    """)
+    res = await session.execute(q, {"since": since.date()})
+    out = []
+    for r in res.fetchall():
+        m = dict(r._mapping)
+        m["pnl"] = float(m["pnl"]) if m.get("pnl") is not None else 0.0
+        m["fees"] = float(m["fees"]) if m.get("fees") is not None else 0.0
+        m["turnover"] = float(m["turnover"]) if m.get("turnover") is not None else 0.0
+        m["trades"] = int(m.get("trades", 0) or 0)
+        out.append(m)
+    return out
+
+async def insert_fill_exec(session: AsyncSession, order_id: int | None, trade_id: str | None, price: float, qty: float, fee: float = 0.0):
+    """Insert d'un fill live avec idempotence (order_id, trade_id) si migration en place."""
+    try:
+        q = text("""
+            INSERT INTO fills (order_id, trade_id, price, qty, fee, ts)
+            VALUES (:oid, :tid, :px, :qty, :fee, now())
+            ON CONFLICT (order_id, trade_id) WHERE order_id IS NOT NULL AND trade_id IS NOT NULL DO NOTHING
+            RETURNING id
+        """)
+        res = await session.execute(q, {"oid": order_id, "tid": trade_id, "px": price, "qty": qty, "fee": fee})
+        row = res.fetchone()
+        return row[0] if row else None
+    except Exception:
+        # Fallback si migration non appliquée: insert sans trade_id
+        q = text("""
+            INSERT INTO fills (order_id, price, qty, fee, ts)
+            VALUES (:oid, :px, :qty, :fee, now())
+            RETURNING id
+        """)
+        res = await session.execute(q, {"oid": order_id, "px": price, "qty": qty, "fee": fee})
+        row = res.fetchone()
+        return row[0] if row else None

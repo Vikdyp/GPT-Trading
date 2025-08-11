@@ -230,7 +230,8 @@ async def ticks_loop():
         symbols = EFFECTIVE_CFG.get("symbols_seed") or []
         if not symbols:
             await asyncio.sleep(1.0); continue
-        streams = "/".join([f"{s.lower()}@miniticker" for s in symbols])
+        # IMPORTANT: stream correct = @miniTicker (camelCase)
+        streams = "/".join([f"{s.lower()}@miniTicker" for s in symbols])
         url = f"{STREAM_BASE}?streams={streams}"
         print(f"[md] ticks ws → {url} ({len(symbols)} syms)")
         try:
@@ -320,6 +321,35 @@ async def kline_loop_trend():
             print("[md] kline trend error:", e)
             await asyncio.sleep(2.0)
 
+async def book_loop():
+    """bookTicker: bid/ask/mid pour une meilleure exécution LIMIT."""
+    while True:
+        symbols = EFFECTIVE_CFG.get("symbols_seed") or []
+        if not symbols:
+            await asyncio.sleep(1.0); continue
+        streams = "/".join([f"{s.lower()}@bookTicker" for s in symbols])
+        url = f"{STREAM_BASE}?streams={streams}"
+        print(f"[md] book ws → {url}")
+        try:
+            async with websockets.connect(url, ping_interval=20, ping_timeout=20) as ws:
+                while True:
+                    data = json.loads(await ws.recv())
+                    d = data.get("data") or {}
+                    sym = d.get("s")
+                    if not sym:
+                        continue
+                    try:
+                        bid = float(d.get("b")); ask = float(d.get("a"))
+                        mid = (bid + ask) / 2.0
+                    except:
+                        continue
+                    payload = {"bid": bid, "ask": ask, "mid": mid, "ts": int(time.time()*1000)}
+                    await r.hset("last_book", sym, json.dumps(payload))
+            # si le ws se ferme, on repart
+        except Exception as e:
+            print("[md] book error:", e)
+            await asyncio.sleep(2.0)
+
 # ---------- CONFIG WATCHER ----------
 async def config_watcher():
     global LAST_RELOAD_ISO, EFFECTIVE_CFG
@@ -367,6 +397,7 @@ async def main():
         asyncio.create_task(ticks_loop()),
         asyncio.create_task(kline_loop_main()),
         asyncio.create_task(kline_loop_trend()),
+        asyncio.create_task(book_loop()),
         asyncio.create_task(config_watcher()),
         asyncio.create_task(periodic_sync_effective()),
     ]

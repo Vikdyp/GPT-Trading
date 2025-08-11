@@ -3,7 +3,8 @@ import json
 import asyncio
 from typing import Optional, Dict, Any
 import redis.asyncio as redis
-from db import get_session, insert_fill, upsert_position
+from db import get_session, insert_fill, upsert_position, get_position, metrics_add_trade
+from notify import notify as _notify
 
 class TrailingManager:
     """
@@ -79,24 +80,33 @@ class TrailingManager:
                     if price > st["high"]:
                         st["high"] = price
 
-                    entry = st["entry_px"]
-                    tp_px = entry * (1.0 + st["tp_pct"])
-                    base_sl_px = entry * (1.0 - st["sl_pct"])
-                    # trailing : high * (1 - sl_pct*trail_mult)
-                    trail_sl_px = st["high"] * (1.0 - st["sl_pct"] * st["trail_mult"])
-                    sl_px = max(base_sl_px, trail_sl_px)
+                    # niveaux TP/SL
+                    tp_px = st["entry_px"] * (1.0 + float(st["tp_pct"]))
+                    # trailing stop basé sur le plus-haut
+                    base_sl = st["entry_px"] * (1.0 - float(st["sl_pct"]))
+                    dyn_sl = st["high"] * (1.0 - float(st["sl_pct"]) * float(st.get("trail_mult", 1.2)))
+                    sl_px = max(base_sl, dyn_sl)
 
-                    # TP hit ?
                     hit_tp = price >= tp_px
-                    # SL/trailing hit ?
                     hit_sl = price <= sl_px
 
                     if hit_tp or hit_sl:
-                        sell_qty = st["qty"] * st["percent"]
-                        # Simuler le fill SELL sur le prix courant
+                        sell_qty = float(st["qty"]) * float(st["percent"])
+                        # Simuler le fill SELL sur le prix courant + realized PnL approximatif
                         async with get_session() as s:
+                            realized = 0.0
+                            prev = await get_position(s, symbol)
+                            if prev:
+                                prev_qty, prev_avg = prev
+                                if prev_qty > 0:
+                                    closed = min(prev_qty, sell_qty)
+                                    realized = closed * (price - prev_avg)
                             await insert_fill(s, None, price, -sell_qty, 0.0)
                             await upsert_position(s, symbol, -sell_qty, price)
+                            try:
+                                await metrics_add_trade(s, realized, 0.0, sell_qty * price)
+                            except Exception:
+                                pass
                             await s.commit()
 
                         # Désactiver ce tracker
@@ -104,6 +114,10 @@ class TrailingManager:
                         await self.r.hset("trailing:states", symbol, json.dumps(st))
                         await self.r.hdel("trailing:states", symbol)
                         print(f"[trail] close {symbol} @ {price:.8f} ({'TP' if hit_tp else 'SL'}) qty={sell_qty}")
+                        try:
+                            await _notify("TP_HIT" if hit_tp else "SL_HIT", {"symbol": symbol, "price": price, "qty": sell_qty})
+                        except Exception:
+                            pass
                         continue
 
                     # persister l'état (high évolue)
