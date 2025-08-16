@@ -6,15 +6,16 @@ from typing import List, Tuple, Dict, Any, Optional
 from datetime import datetime, timezone, timedelta
 from zoneinfo import ZoneInfo
 
-from fastapi import FastAPI, WebSocket, WebSocketDisconnect, HTTPException, Query
+from fastapi import FastAPI, WebSocket, WebSocketDisconnect, HTTPException, Query, APIRouter
 from fastapi.middleware.cors import CORSMiddleware
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
 import httpx
 import yaml
 import redis.asyncio as redis
 import websockets
 from sqlalchemy import text
 
+from backtest import run_backtest
 from libs.common.signals import SignalsConfig, compute_signal
 from notify import notify as _notify
 from trailing import TrailingManager
@@ -824,8 +825,8 @@ async def signals_preview(symbol: str, lookback_1m: int = 200, lookback_4h: int 
     cooldown_ok = True
     cooldown_key = f"signals:cooldown:{sym}"
     try:
-        cd = int(cfg["cooldown_sec"])
-        if cd > 0 and await redis.get(cooldown_key):
+        cd = int(getattr(cfg, "cooldown_sec", 0))
+        if cd > 0 and (await r.get(cooldown_key)):
             cooldown_ok = False
     except Exception:
         pass
@@ -848,9 +849,9 @@ async def signals_preview(symbol: str, lookback_1m: int = 200, lookback_4h: int 
 class LadderPreviewReq(BaseModel):
     symbol: str
     side: str               # BUY/SELL
-    total_quote_eur: float  # budget total en €
-    n_levels: int = 3
-    step_bps: int = 20
+    total_quote_eur: float
+    n_levels: int = Field(3, alias="levels")
+    step_bps: int = Field(20, alias="radius_bps")
     tif: Optional[str] = "GTC"
     limit_maker: bool = False
 
@@ -1324,13 +1325,70 @@ async def place_oco(symbol: str, body: OcoReq):
     res = exec_client.new_oco_sell(symbol, qty_set, tp_price, sl_stop, sl_limit)
     return {"ok": True, "mode": "live", "binance": res}
 
+
+class BacktestReq(BaseModel):
+    symbol: str
+    start_ts: int   # ms
+    end_ts: int     # ms
+    params: dict = {}
+    fee_bps: float = 2.0
+    slip_bps: float = 1.0
+
+@app.post("/backtest/run")
+async def backtest_run(req: BacktestReq):
+    import asyncpg, os
+    dsn = os.environ["DATABASE_URL"].replace("postgresql+asyncpg","postgresql")
+    conn = await asyncpg.connect(dsn)
+
+    # ms -> datetime UTC
+    start_dt = datetime.fromtimestamp(req.start_ts/1000.0, tz=timezone.utc)
+    end_dt   = datetime.fromtimestamp(req.end_ts/1000.0,   tz=timezone.utc)
+
+    q1m = """
+    SELECT EXTRACT(EPOCH FROM ts)*1000 AS ts_ms, high, low, close, volume
+    FROM candles
+    WHERE symbol=$1 AND tf='1m' AND ts BETWEEN $2 AND $3
+    ORDER BY ts;
+    """
+    rows1 = await conn.fetch(q1m, req.symbol, start_dt, end_dt)
+
+    q4h = """
+    SELECT EXTRACT(EPOCH FROM ts)*1000 AS ts_ms, close
+    FROM candles
+    WHERE symbol=$1
+    AND tf='4h'
+    AND ts BETWEEN ($2::timestamptz - INTERVAL '90 days') AND $3::timestamptz
+    ORDER BY ts;
+    """
+    rows4 = await conn.fetch(q4h, req.symbol, start_dt, end_dt)
+
+    await conn.close()
+
+    kl_1m = [
+        {"ts": int(r["ts_ms"]),
+         "high": float(r["high"]), "low": float(r["low"]),
+         "close": float(r["close"]), "volume": float(r["volume"])}
+        for r in rows1
+    ]
+    kl_4h = [
+        {"ts": int(r["ts_ms"]), "close": float(r["close"])}
+        for r in rows4
+    ]
+
+    return run_backtest(
+        kl_1m, kl_4h, req.params,
+        fee_bps=req.fee_bps, slip_bps=req.slip_bps
+    )
+
 # --------------- HYDRATATION (endpoints) -------------
 HYDRATE_TASK: asyncio.Task | None = None
 HYDRATE_STATUS: Dict[str, Any] = {"running": False, "done": False, "inserted": 0, "current_symbol": None, "current_tf": None, "last_gap": None}
 
 class HydrateReq(BaseModel):
-    lookback_days: int = 30
-    intervals: List[str] = ["1m", "1h", "4h"]
+    # compat: accepte à la fois "lookback_days" (nouveau) et "days" (ancien)
+    lookback_days: int = Field(30, alias="days")
+    # compat: accepte "intervals" (nouveau) et "tfs" (ancien)
+    intervals: List[str] = Field(default_factory=lambda: ["1m", "1h", "4h"], alias="tfs")
     symbols: Optional[List[str]] = None  # si None -> seed de la config
 
 @app.post("/debug/hydrate/start")
@@ -1339,24 +1397,23 @@ async def debug_hydrate_start(req: HydrateReq):
     if HYDRATE_TASK and not HYDRATE_TASK.done():
         return {"status": "already_running", **HYDRATE_STATUS}
 
-    # charge symboles (seed) si non fournis
     symbols = (req.symbols if (req.symbols and len(req.symbols) > 0) else (APP_CONFIG.symbols_seed or []))
     intervals = [tf for tf in req.intervals if tf in ("1m","1h","4h")]
+    lookback_days = int(req.lookback_days)  # <= respecte bien la valeur demandée (pas de clamp 30)
 
     HYDRATE_STATUS = {"running": True, "done": False, "inserted": 0, "current_symbol": None, "current_tf": None, "last_gap": None}
-    # lance en tâche de fond (non bloquant)
+
     async def runner():
         try:
-            # init engine si besoin (évite un get_session() non initialisé)
             get_engine(DB_URL)
-            await _hydrate_job(symbols, intervals, int(req.lookback_days), HYDRATE_STATUS)
+            await _hydrate_job(symbols, intervals, lookback_days, HYDRATE_STATUS)
         except Exception as e:
             HYDRATE_STATUS["error"] = str(e)
         finally:
             HYDRATE_STATUS["running"] = False
 
     HYDRATE_TASK = asyncio.create_task(runner())
-    return {"status": "started", "symbols": symbols, "intervals": intervals, "lookback_days": req.lookback_days}
+    return {"status": "started", "symbols": symbols, "intervals": intervals, "lookback_days": lookback_days}
 
 @app.get("/debug/hydrate/status")
 async def debug_hydrate_status():

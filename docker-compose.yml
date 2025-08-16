@@ -7,7 +7,7 @@ services:
       POSTGRES_PASSWORD: botpass
       POSTGRES_DB: botdb
     ports:
-      - "5433:5432"                 # tu t’y connectes en local sur 5433
+      - "5433:5432"                   # accès local via 5433
     volumes:
       - pgdata:/var/lib/postgresql/data
       - ./db/init:/docker-entrypoint-initdb.d:ro
@@ -15,12 +15,10 @@ services:
   adminer:
     image: adminer
     container_name: pro-bot-adminer
-    environment:
-      - ADMINER_DEFAULT_SERVER=postgres
     depends_on:
       - postgres
     ports:
-      - "8080:8080"                 # UI DB dans le navigateur sur http://localhost:8080
+      - "8080:8080"
 
   redis:
     image: redis:7
@@ -29,7 +27,9 @@ services:
       - "6379:6379"
 
   api:
-    build: ./services/api
+    build:
+      context: .                               # ✅ racine du repo
+      dockerfile: services/api/Dockerfile      # ✅ ce Dockerfile API
     container_name: pro-bot-api
     env_file:
       - .env
@@ -38,14 +38,9 @@ services:
       - REDIS_URL=redis://redis:6379/0
       - DATABASE_URL=postgresql+asyncpg://bot:botpass@postgres:5432/botdb
       - CONFIG_PATH=/app/config/app.yaml
-      - BINANCE_MODE=mainnet
+      - BINANCE_MODE=mainnet                   # mets "testnet" pour essais
       - LIVE_TRADING=false
       - EXECUTION_TEST_ORDERS=true
-      - DISCORD_ENABLE=${DISCORD_ENABLE}
-      - DISCORD_WEBHOOK_URL=${DISCORD_WEBHOOK_URL}
-      - DISCORD_USERNAME=${DISCORD_USERNAME}
-      - DISCORD_AVATAR_URL=${DISCORD_AVATAR_URL}
-
     depends_on:
       - postgres
       - redis
@@ -55,12 +50,14 @@ services:
       - ./config:/app/config:ro
 
   market_data:
-    build: ./services/market_data
+    build:
+      context: .                               # ✅ racine du repo
+      dockerfile: services/market_data/Dockerfile
     container_name: pro-bot-market
     environment:
       - REDIS_URL=redis://redis:6379/0
       - CONFIG_PATH=/app/config/app.yaml
-      - BINANCE_MODE=mainnet
+      - BINANCE_MODE=mainnet                   # ou "testnet" selon tes tests
     depends_on:
       - redis
     volumes:
